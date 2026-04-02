@@ -124,6 +124,7 @@ ECO_POLL_SECONDS=120
 # Turbo mode (inside peak windows)
 TURBO_POLL_SECONDS=8
 # Comma-separated hour ranges in UTC (start-end), supports wrap windows
+# Note: same-hour token like 18-18 means one hour [18:00,19:00), not 24h turbo.
 TURBO_HOURS_UTC=18-21
 
 # =========================
@@ -146,6 +147,7 @@ QUOTA_COOLDOWN_SECONDS=180
 ```bash
 cd /absolute/path/to/doma-pulsebot
 source .venv/bin/activate
+ps aux | grep "python bot.py" | grep -v grep
 nohup python bot.py > bot.log 2>&1 &
 echo $! > bot.pid
 ```

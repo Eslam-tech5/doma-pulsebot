@@ -85,6 +85,7 @@ class WatcherConfig:
     allowed_tlds: set[str] = field(default_factory=lambda: {".dev", ".app", ".cloud"})
     keyword_value_usd: float = 22.0
     atom_partnership_url: str = ""
+    atom_partnership_urls: tuple[str, ...] = tuple()
     atom_partnership_api_key: str = ""
     atom_appraisal_url: str = ""
     atom_appraisal_api_key: str = ""
@@ -156,6 +157,7 @@ class WatcherConfig:
             allowed_tlds=allowed_tlds or {".dev", ".app", ".cloud"},
             keyword_value_usd=float(os.getenv("KEYWORD_VALUE_USD", "22")),
             atom_partnership_url=partnership_urls[0] if partnership_urls else "",
+            atom_partnership_urls=partnership_urls,
             atom_partnership_api_key=os.getenv("ATOM_PARTNERSHIP_API_KEY", "").strip(),
             atom_appraisal_url=os.getenv("ATOM_APPRAISAL_API_URL", "").strip(),
             atom_appraisal_api_key=os.getenv("ATOM_APPRAISAL_API_KEY", "").strip(),
@@ -189,6 +191,7 @@ def parse_turbo_hours(raw_value: str) -> tuple[tuple[int, int], ...]:
         except ValueError:
             continue
         if 0 <= start <= 23 and 0 <= end <= 23:
+            # same-hour token like "18-18" is treated as a one-hour window [18:00, 19:00)
             if start == end:
                 end = (start + 1) % 24
             ranges.append((start, end))
@@ -349,10 +352,7 @@ class AtomClient:
     def __init__(self, session: aiohttp.ClientSession, cfg: WatcherConfig) -> None:
         self.session = session
         self.cfg = cfg
-        self._partnership_urls = self._normalize_urls(
-            os.getenv("ATOM_PARTNERSHIP_API_URLS", ""),
-            cfg.atom_partnership_url,
-        )
+        self._partnership_urls = cfg.atom_partnership_urls
         self._round_robin_index = 0
         self._quota_backoff_until_monotonic = 0.0
 
@@ -370,13 +370,6 @@ class AtomClient:
                 self.cfg.human_delay_max_seconds,
             )
         )
-
-    @staticmethod
-    def _normalize_urls(raw_urls: str, fallback_url: str) -> tuple[str, ...]:
-        urls = tuple(url.strip() for url in raw_urls.split(",") if url.strip())
-        if urls:
-            return urls
-        return (fallback_url,) if fallback_url else tuple()
 
     def _note_rate_limit(self) -> None:
         loop = asyncio.get_running_loop()
