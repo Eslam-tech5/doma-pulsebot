@@ -87,6 +87,7 @@ class WatcherConfig:
     high_value_keywords: set[str] = field(default_factory=lambda: {"ai", "tech", "finance"})
     keyword_value_usd: float = 22.0
     atom_partnership_url: str = ""
+    atom_domain_base_url: str = "https://www.atom.com/domains"
     atom_api_key: str = ""
     atom_user_id: str = ""
     atom_appraisal_url: str = ""
@@ -140,6 +141,7 @@ class WatcherConfig:
             high_value_keywords=high_value_keywords or {"ai", "tech", "finance"},
             keyword_value_usd=float(os.getenv("KEYWORD_VALUE_USD", "22")),
             atom_partnership_url=partnership_url,
+            atom_domain_base_url=os.getenv("ATOM_DOMAIN_BASE_URL", "https://www.atom.com/domains").strip() or "https://www.atom.com/domains",
             atom_api_key=os.getenv("ATOM_API_KEY", "").strip(),
             atom_user_id=os.getenv("ATOM_USER_ID", "").strip(),
             atom_appraisal_url=appraisal_url,
@@ -783,8 +785,7 @@ def format_alert(opportunity: DomainOpportunity, valuation: ValuationResult) -> 
         f"🏪 *Source:* {source}\n"
         f"💵 *Asking vs Appraisal:* {ask} vs {estimate}\n"
         f"📈 *Arbitrage Gap \\(Est\\. Profit\\):* {gap} \\({ratio}\\)\n"
-        f"⚙️ *Valuation Method:* `{method}`\n"
-        f"🔗 *Domain:* `{domain}`"
+        f"⚙️ *Valuation Method:* `{method}`"
     )
 
 
@@ -793,8 +794,10 @@ async def emit_alert(
     chat_id: int,
     opportunity: DomainOpportunity,
     valuation: ValuationResult,
+    cfg: WatcherConfig,
 ) -> None:
-    atom_buy_url = f"https://www.atom.com/domains/{opportunity.domain}"
+    atom_base = cfg.atom_domain_base_url.rstrip("/")
+    atom_buy_url = f"{atom_base}/{opportunity.domain}"
     keyboard = InlineKeyboardMarkup(
         [
             [InlineKeyboardButton("🛒 Buy on Atom", url=atom_buy_url)],
@@ -842,9 +845,14 @@ def _chat_filter_matches(
     if min_appraisal is not None and valuation.estimated_value_usd < min_appraisal:
         return False
 
-    max_length = parse_float(filters.get("max_length"))
-    if max_length is not None and len(opportunity.sld) > int(max_length):
-        return False
+    max_length_raw = filters.get("max_length")
+    if max_length_raw is not None:
+        try:
+            max_length = int(max_length_raw)
+        except (TypeError, ValueError):
+            max_length = None
+        if max_length is not None and len(opportunity.sld) > max_length:
+            return False
 
     keywords = filters.get("keywords")
     if isinstance(keywords, list) and keywords:
@@ -974,7 +982,7 @@ async def watch_events(app: Application, chat_id: int) -> None:
                                 continue
 
                         try:
-                            await emit_alert(app, target_chat_id, opportunity, valuation)
+                            await emit_alert(app, target_chat_id, opportunity, valuation, cfg)
                             store.mark_alerted(target_chat_id, opportunity.domain, opportunity.source)
                             LOGGER.info(
                                 "Alert sent chat_id=%s domain=%s ask=$%.2f estimate=$%.2f method=%s",

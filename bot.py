@@ -71,9 +71,21 @@ def get_chat_filters(store: dict[str, Any], chat_id: int) -> dict[str, Any]:
         if isinstance(kw, str) and kw in KEYWORD_OPTIONS
     ]
 
-    for key in ("max_price", "min_appraisal", "max_length"):
-        if merged.get(key) in ("", 0, "0"):
+    numeric_allowed = {
+        "max_price": set(PRICE_OPTIONS),
+        "min_appraisal": set(MIN_APPRAISAL_OPTIONS),
+        "max_length": set(MAX_LENGTH_OPTIONS),
+    }
+    for key, allowed_values in numeric_allowed.items():
+        raw_value = merged.get(key)
+        if raw_value is None:
+            continue
+        try:
+            parsed = int(raw_value)
+        except (TypeError, ValueError):
             merged[key] = None
+            continue
+        merged[key] = parsed if parsed in allowed_values else None
 
     merged["trademark_check"] = bool(merged.get("trademark_check", True))
     store[chat_key] = merged
