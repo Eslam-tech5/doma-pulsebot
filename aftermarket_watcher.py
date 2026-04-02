@@ -5,7 +5,9 @@ from typing import Optional
 import aiohttp
 from bs4 import BeautifulSoup
 
-MARKETPLACE_PRICE_RE = re.compile(r"(?:\$|usd\s*)?([0-9]+(?:\.[0-9]{1,2})?)", re.IGNORECASE)
+PRICE_EXTRACTION_RE = re.compile(r"(?:\$|usd\s*)?([0-9]+(?:\.[0-9]{1,2})?)", re.IGNORECASE)
+MIN_ALLOWED_AFTERMARKET_LISTINGS = 10
+DEFAULT_HTML_SELECTORS = "tr, li, article, .listing, .result, .domain"
 
 
 class AftermarketSource:
@@ -16,11 +18,13 @@ class AftermarketSource:
         page_url: str,
         allowed_tlds: set[str],
         max_listings: int,
+        html_selectors: str = DEFAULT_HTML_SELECTORS,
     ) -> None:
         self.session = session
         self.source_name = source_name
         self.page_url = page_url
-        self.max_listings = max(10, max_listings)
+        self.max_listings = max(MIN_ALLOWED_AFTERMARKET_LISTINGS, max_listings)
+        self.html_selectors = html_selectors or DEFAULT_HTML_SELECTORS
         tld_pattern = "|".join(sorted(tld.lstrip(".") for tld in allowed_tlds))
         self.domain_re = re.compile(rf"\b([a-z0-9-]+\.(?:{tld_pattern}))\b", re.IGNORECASE)
 
@@ -82,7 +86,7 @@ class AftermarketSource:
         soup = BeautifulSoup(html, "html.parser")
         listings: list[dict] = []
         seen: set[str] = set()
-        for row in soup.select("tr, li, article, .listing, .result, .domain"):
+        for row in soup.select(self.html_selectors):
             text = row.get_text(" ", strip=True)
             match = self.domain_re.search(text)
             if not match:
@@ -116,7 +120,7 @@ class AftermarketSource:
         if isinstance(value, (int, float)):
             return float(value)
         text = str(value)
-        match = MARKETPLACE_PRICE_RE.search(text)
+        match = PRICE_EXTRACTION_RE.search(text)
         if not match:
             return None
         try:

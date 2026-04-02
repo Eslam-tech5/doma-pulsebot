@@ -22,6 +22,7 @@ LOGGER = logging.getLogger(__name__)
 SPECIAL_CHARS = r"_*[]()~`>#+-=|{}.!"
 GODADDY_MICRO_PRICE_THRESHOLD = 1000.0
 GODADDY_MICRO_DIVISOR = 1_000_000.0
+MIN_CACHE_TTL_SECONDS = 60
 
 
 class RetryableAPIError(Exception):
@@ -169,6 +170,8 @@ class WatcherConfig:
     )
     keyword_value_usd: float = 9.0
     max_short_name_bonus_usd: float = 12.0
+    short_name_bonus_per_char_usd: float = 1.1
+    aftermarket_intrinsic_multiplier: float = 1.1
     base_intrinsic_value_usd: float = 8.0
     arbitrage_min_gap_usd: float = 20.0
     arbitrage_min_ratio: float = 1.8
@@ -189,6 +192,7 @@ class WatcherConfig:
     eco_mode_enabled: bool = True
     eco_poll_seconds: int = 120
     turbo_poll_seconds: int = 30
+    min_poll_seconds: int = 5
     turbo_hours_utc: set[int] = field(default_factory=lambda: {12, 13, 14, 15, 16, 17, 18, 19, 20, 21})
     eco_dead_hours_utc: set[int] = field(default_factory=lambda: {0, 1, 2, 3, 4, 5, 6})
     aftermarket_enabled: bool = True
@@ -196,8 +200,12 @@ class WatcherConfig:
     namecheap_marketplace_url: str = "https://www.namecheap.com/domains/marketplace/"
     dynadot_aftermarket_url: str = "https://www.dynadot.com/market/"
     godaddy_closeouts_url: str = "https://www.godaddy.com/domains/aftermarket"
+    namecheap_marketplace_selectors: str = "tr, li, article, .listing, .result, .domain"
+    dynadot_aftermarket_selectors: str = "tr, li, article, .listing, .result, .domain"
+    godaddy_closeouts_selectors: str = "tr, li, article, .listing, .result, .domain"
     dynadot_api_key: str = ""
     dynadot_base_url: str = "https://api.dynadot.com/api3.json"
+    fallback_marketplace_url: str = "https://www.namecheap.com/domains/marketplace/"
     supplemental_words: list[str] = field(
         default_factory=lambda: [
             "byte",
@@ -213,9 +221,13 @@ class WatcherConfig:
         ]
     )
 
+    @property
+    def discount_trigger_fraction(self) -> float:
+        return self.discount_trigger_pct / 100.0
+
     @classmethod
     def from_env(cls) -> "WatcherConfig":
-        def parse_hours(raw: str, default: set[int]) -> set[int]:
+        def parse_utc_hour_ranges(raw: str, default: set[int]) -> set[int]:
             values: set[int] = set()
             for token in raw.split(","):
                 token = token.strip()
@@ -243,9 +255,9 @@ class WatcherConfig:
                     continue
                 if 0 <= hour <= 23:
                     values.add(hour)
-            return values or set(default)
+            return values or default
 
-        def parse_tld_weights(raw: str, default: dict[str, float]) -> dict[str, float]:
+        def parse_tld_weights_from_env(raw: str, default: dict[str, float]) -> dict[str, float]:
             if not raw.strip():
                 return dict(default)
             parsed: dict[str, float] = {}
@@ -307,12 +319,14 @@ class WatcherConfig:
             },
             standard_reg_max=float(os.getenv("STANDARD_REG_MAX_USD", "15")),
             discount_trigger_pct=float(os.getenv("DISCOUNT_TRIGGER_PERCENT", "50")),
-            tld_value_weights=parse_tld_weights(
+            tld_value_weights=parse_tld_weights_from_env(
                 os.getenv("TLD_VALUE_WEIGHTS", ""),
                 default_weights,
             ),
             keyword_value_usd=float(os.getenv("KEYWORD_VALUE_USD", "9")),
             max_short_name_bonus_usd=float(os.getenv("MAX_SHORT_NAME_BONUS_USD", "12")),
+            short_name_bonus_per_char_usd=float(os.getenv("SHORT_NAME_BONUS_PER_CHAR_USD", "1.1")),
+            aftermarket_intrinsic_multiplier=float(os.getenv("AFTERMARKET_INTRINSIC_MULTIPLIER", "1.1")),
             base_intrinsic_value_usd=float(os.getenv("BASE_INTRINSIC_VALUE_USD", "8")),
             arbitrage_min_gap_usd=float(os.getenv("ARBITRAGE_MIN_GAP_USD", "20")),
             arbitrage_min_ratio=float(os.getenv("ARBITRAGE_MIN_RATIO", "1.8")),
@@ -338,11 +352,12 @@ class WatcherConfig:
             eco_mode_enabled=os.getenv("ECO_MODE_ENABLED", "true").lower() == "true",
             eco_poll_seconds=int(os.getenv("ECO_POLL_SECONDS", "120")),
             turbo_poll_seconds=int(os.getenv("TURBO_POLL_SECONDS", "30")),
-            turbo_hours_utc=parse_hours(
+            min_poll_seconds=int(os.getenv("MIN_POLL_SECONDS", "5")),
+            turbo_hours_utc=parse_utc_hour_ranges(
                 os.getenv("TURBO_HOURS_UTC", "12-21"),
                 {12, 13, 14, 15, 16, 17, 18, 19, 20, 21},
             ),
-            eco_dead_hours_utc=parse_hours(
+            eco_dead_hours_utc=parse_utc_hour_ranges(
                 os.getenv("ECO_DEAD_HOURS_UTC", "0-6"),
                 {0, 1, 2, 3, 4, 5, 6},
             ),
@@ -362,8 +377,24 @@ class WatcherConfig:
                 "GODADDY_CLOSEOUTS_URL",
                 "https://www.godaddy.com/domains/aftermarket",
             ).strip(),
+            namecheap_marketplace_selectors=os.getenv(
+                "NAMECHEAP_MARKETPLACE_SELECTORS",
+                "tr, li, article, .listing, .result, .domain",
+            ).strip(),
+            dynadot_aftermarket_selectors=os.getenv(
+                "DYNADOT_AFTERMARKET_SELECTORS",
+                "tr, li, article, .listing, .result, .domain",
+            ).strip(),
+            godaddy_closeouts_selectors=os.getenv(
+                "GODADDY_CLOSEOUTS_SELECTORS",
+                "tr, li, article, .listing, .result, .domain",
+            ).strip(),
             dynadot_api_key=os.getenv("DYNADOT_API_KEY", "").strip(),
             dynadot_base_url=os.getenv("DYNADOT_BASE_URL", "https://api.dynadot.com/api3.json").strip(),
+            fallback_marketplace_url=os.getenv(
+                "FALLBACK_MARKETPLACE_URL",
+                "https://www.namecheap.com/domains/marketplace/",
+            ).strip(),
             supplemental_words=[
                 w.strip().lower()
                 for w in os.getenv(
@@ -412,7 +443,7 @@ class AlertStore:
 
 class DomainCheckCache:
     def __init__(self, ttl_seconds: int) -> None:
-        self.ttl_seconds = max(60, ttl_seconds)
+        self.ttl_seconds = max(MIN_CACHE_TTL_SECONDS, ttl_seconds)
         self._cache: dict[str, datetime] = {}
 
     def should_check(self, domain: str) -> bool:
@@ -979,9 +1010,9 @@ def evaluate_domain(listing: DomainListing, cfg: WatcherConfig) -> ArbitrageEval
     if premium_kw:
         intrinsic += cfg.keyword_value_usd
     shortness = max(0, cfg.max_sld_len - len(listing.sld))
-    intrinsic += min(cfg.max_short_name_bonus_usd, shortness * 1.1)
+    intrinsic += min(cfg.max_short_name_bonus_usd, shortness * cfg.short_name_bonus_per_char_usd)
     if listing.is_aftermarket:
-        intrinsic *= 1.1
+        intrinsic *= cfg.aftermarket_intrinsic_multiplier
 
     if listing.price_usd is None or listing.price_usd <= 0:
         return ArbitrageEvaluation(
@@ -994,7 +1025,7 @@ def evaluate_domain(listing: DomainListing, cfg: WatcherConfig) -> ArbitrageEval
 
     gap = intrinsic - listing.price_usd
     ratio = intrinsic / listing.price_usd
-    discount_floor_price = cfg.standard_reg_max * (1 - cfg.discount_trigger_pct / 100)
+    discount_floor_price = cfg.standard_reg_max * (1 - cfg.discount_trigger_fraction)
     is_hot = gap >= cfg.arbitrage_min_gap_usd and ratio >= cfg.arbitrage_min_ratio
     if not is_hot and premium_kw and listing.price_usd <= discount_floor_price:
         is_hot = True
@@ -1011,6 +1042,22 @@ def evaluate_domain(listing: DomainListing, cfg: WatcherConfig) -> ArbitrageEval
         premium_keyword=premium_kw,
         hot_deal_reason=reason,
     )
+
+
+def distribute_candidates_across_providers(
+    candidates: Sequence[str],
+    provider_names: Sequence[str],
+    cycle: int,
+) -> dict[str, list[str]]:
+    if not candidates or not provider_names:
+        return {}
+    offset = cycle % len(provider_names)
+    rotated = list(provider_names[offset:]) + list(provider_names[:offset])
+    shards: dict[str, list[str]] = {name: [] for name in rotated}
+    for idx, domain in enumerate(candidates):
+        provider_name = rotated[idx % len(rotated)]
+        shards[provider_name].append(domain)
+    return shards
 
 
 def format_alert(listing: DomainListing, hot_reason: Optional[str]) -> str:
@@ -1115,7 +1162,7 @@ async def watch_events(app: Application, chat_id: int) -> None:
             return cfg.poll_seconds
         utc_hour = datetime.now(timezone.utc).hour
         if utc_hour in cfg.turbo_hours_utc:
-            return max(5, cfg.turbo_poll_seconds)
+            return max(cfg.min_poll_seconds, cfg.turbo_poll_seconds)
         if utc_hour in cfg.eco_dead_hours_utc:
             return max(cfg.poll_seconds, cfg.eco_poll_seconds)
         return cfg.poll_seconds
@@ -1203,6 +1250,7 @@ async def watch_events(app: Application, chat_id: int) -> None:
                         cfg.namecheap_marketplace_url,
                         cfg.allowed_tlds,
                         cfg.aftermarket_max_listings_per_source,
+                        cfg.namecheap_marketplace_selectors,
                     )
                 )
             if cfg.dynadot_aftermarket_url:
@@ -1213,6 +1261,7 @@ async def watch_events(app: Application, chat_id: int) -> None:
                         cfg.dynadot_aftermarket_url,
                         cfg.allowed_tlds,
                         cfg.aftermarket_max_listings_per_source,
+                        cfg.dynadot_aftermarket_selectors,
                     )
                 )
             if cfg.godaddy_closeouts_url:
@@ -1223,6 +1272,7 @@ async def watch_events(app: Application, chat_id: int) -> None:
                         cfg.godaddy_closeouts_url,
                         cfg.allowed_tlds,
                         cfg.aftermarket_max_listings_per_source,
+                        cfg.godaddy_closeouts_selectors,
                     )
                 )
 
@@ -1246,14 +1296,11 @@ async def watch_events(app: Application, chat_id: int) -> None:
                 if provider_sources:
                     candidates = [d for d in build_candidates(cfg) if check_cache.should_check(d)]
                     if candidates:
-                        offset = cycle % len(provider_sources)
-                        rotated = provider_sources[offset:] + provider_sources[:offset]
-                        shards: dict[str, list[str]] = {name: [] for name, _ in rotated}
-                        for idx, domain in enumerate(candidates):
-                            provider_name, _ = rotated[idx % len(rotated)]
-                            shards[provider_name].append(domain)
+                        provider_names = [name for name, _ in provider_sources]
+                        shards = distribute_candidates_across_providers(candidates, provider_names, cycle)
+                        for domain in candidates:
                             check_cache.mark_checked(domain)
-                        source_map = {name: src for name, src in rotated}
+                        source_map = {name: src for name, src in provider_sources}
                         for provider_name, provider_candidates in shards.items():
                             if provider_candidates:
                                 tasks.append(
@@ -1268,13 +1315,13 @@ async def watch_events(app: Application, chat_id: int) -> None:
                     results = await asyncio.gather(*tasks, return_exceptions=True)
                     for result in results:
                         if isinstance(result, list):
-                            if result and isinstance(result[0], dict):
+                            if result and all(isinstance(item, dict) for item in result):
                                 normalized: list[DomainListing] = []
                                 for row in result:
                                     try:
                                         domain = str(row.get("domain", "")).strip().lower()
                                         source = str(row.get("source", "Aftermarket")).strip() or "Aftermarket"
-                                        buy_url = str(row.get("buy_url", "")).strip() or "https://www.google.com/search?q=domain+marketplace"
+                                        buy_url = str(row.get("buy_url", "")).strip() or cfg.fallback_marketplace_url
                                         raw_price = row.get("price_usd")
                                         price_usd = float(raw_price) if raw_price is not None else None
                                         currency = str(row.get("currency", "USD")).strip() or "USD"
