@@ -475,9 +475,10 @@ class AtomClient:
     ) -> Optional[Any]:
         if not urls:
             return None
-        if self.circuit_open_remaining_seconds() > 0:
+        circuit_wait = self.circuit_open_remaining_seconds()
+        if circuit_wait > 0:
             raise AtomCircuitOpenError(
-                f"{context_label} blocked by circuit breaker for {self.circuit_open_remaining_seconds()}s"
+                f"{context_label} blocked by circuit breaker for {circuit_wait}s"
             )
 
         last_error: Optional[str] = None
@@ -543,7 +544,7 @@ class AtomClient:
                 last_error = f"{type(exc).__name__}: {exc}"
                 self._note_retryable_failure()
                 wait_seconds = self._backoff_seconds(attempt)
-                LOGGER.info("%s network error; retrying in %.2fs", context_label, wait_seconds)
+                LOGGER.info("%s network error: %s; retrying in %.2fs", context_label, exc, wait_seconds)
                 await asyncio.sleep(wait_seconds)
 
         if last_error:
@@ -674,7 +675,7 @@ class AtomClient:
             except aiohttp.ClientError as exc:
                 self._note_retryable_failure()
                 wait_seconds = self._backoff_seconds(attempt)
-                LOGGER.info("Appraisal API network error; retrying in %.2fs", wait_seconds)
+                LOGGER.info("Appraisal API network error: %s; retrying in %.2fs", exc, wait_seconds)
                 await asyncio.sleep(wait_seconds)
         else:
             raise AppraisalUnavailableError(
