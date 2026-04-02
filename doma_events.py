@@ -458,7 +458,9 @@ class AtomClient:
             self.cfg.max_backoff_seconds,
             self.cfg.retry_base_seconds * (2 ** (attempt - 1)),
         )
-        return random.uniform(0.0, max(capped_exponential, MIN_RETRY_BASE_SECONDS))
+        lower = min(self.cfg.retry_base_seconds, capped_exponential)
+        upper = max(self.cfg.retry_base_seconds, capped_exponential)
+        return random.uniform(lower, upper)
 
     async def _request_json_with_retry(
         self,
@@ -538,11 +540,6 @@ class AtomClient:
                 wait_seconds = self._backoff_seconds(attempt)
                 LOGGER.info("%s network error; retrying in %.2fs", context_label, wait_seconds)
                 await asyncio.sleep(wait_seconds)
-
-            if self.circuit_open_remaining_seconds() > 0:
-                raise AtomCircuitOpenError(
-                    f"{context_label} circuit opened for {self.circuit_open_remaining_seconds()}s"
-                )
 
         if last_error:
             raise RuntimeError(f"{context_label} failed after retries: {last_error}")
@@ -677,10 +674,6 @@ class AtomClient:
                 wait_seconds = self._backoff_seconds(attempt)
                 LOGGER.info("Appraisal API network error; retrying in %.2fs", wait_seconds)
                 await asyncio.sleep(wait_seconds)
-            if self.circuit_open_remaining_seconds() > 0:
-                raise AppraisalUnavailableError(
-                    f"AI appraisal temporarily paused by circuit breaker ({self.circuit_open_remaining_seconds()}s)"
-                )
         else:
             raise AppraisalUnavailableError(
                 f"AI appraisal retries exhausted for {domain} after {self.cfg.max_retry_attempts} attempts"
