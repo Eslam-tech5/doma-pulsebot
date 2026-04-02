@@ -358,11 +358,12 @@ def build_candidates(cfg: WatcherConfig) -> list[str]:
     short_words = [w for w in base_words if len(w) <= cfg.max_sld_len]
     if not short_words:
         short_words = ["ai", "dev", "app", "bot", "code"]
+    allowed_tlds = tuple(cfg.allowed_tlds)
 
     domains = set()
     for _ in range(cfg.go_candidates_per_cycle):
         word = random.choice(short_words)
-        tld = random.choice(tuple(cfg.allowed_tlds))
+        tld = random.choice(allowed_tlds)
         domains.add(f"{word}{tld}")
     return list(domains)
 
