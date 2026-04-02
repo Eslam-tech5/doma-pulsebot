@@ -4,7 +4,7 @@ import os
 import random
 import re
 import sqlite3
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from datetime import datetime, timezone
 from typing import Iterable, List, Optional, Sequence
 
@@ -122,7 +122,7 @@ class WatcherConfig:
 
 class AlertStore:
     def __init__(self, db_path: str) -> None:
-        self.conn = sqlite3.connect(db_path, check_same_thread=False)
+        self.conn = sqlite3.connect(db_path)
         self.conn.execute(
             """
             CREATE TABLE IF NOT EXISTS sent_alerts (
@@ -206,6 +206,8 @@ class GoDaddyAvailabilitySource:
             price_usd = None
             if isinstance(raw_price, (int, float)):
                 price_usd = float(raw_price)
+                # GoDaddy returns integer price in micros for many products.
+                # Example: 12990000 => 12.99 USD.
                 if price_usd > 1000:
                     price_usd = round(price_usd / 1_000_000, 2)
             return DomainListing(
@@ -415,16 +417,7 @@ async def watch_events(app: Application, chat_id: int) -> None:
                     kw = keyword_hit(listing.sld, cfg.keywords)
                     if not kw:
                         continue
-                    listing = DomainListing(
-                        domain=listing.domain,
-                        source=listing.source,
-                        buy_url=listing.buy_url,
-                        price_usd=listing.price_usd,
-                        currency=listing.currency,
-                        is_drop=listing.is_drop,
-                        is_expired=listing.is_expired,
-                        keyword_match=kw,
-                    )
+                    listing = replace(listing, keyword_match=kw)
 
                     if store.has_alerted(listing.domain):
                         continue
