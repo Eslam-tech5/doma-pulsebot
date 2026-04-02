@@ -404,12 +404,12 @@ def format_alert(opportunity: DomainOpportunity, valuation: ValuationResult) -> 
     ratio = escape_md_v2(f"x{valuation.margin_ratio:.2f}")
 
     return (
-        "🔥 *High\-Margin Domain Deal*\n"
+        r"🔥 *High\-Margin Domain Deal*\n"
         f"🌐 *Domain:* `{domain}`\n"
         f"🏪 *Source:* {source}\n"
         f"💵 *Asking Price:* {ask}\n"
         f"🧠 *Estimated Value:* {estimate}\n"
-        f"📈 *Gap:* {gap} \({ratio}\)\n"
+        fr"📈 *Gap:* {gap} \({ratio}\)\n"
         f"⚙️ *Valuation Method:* `{method}`\n"
         f"🔗 *Listing:* {listing_url}"
     )
