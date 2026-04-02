@@ -22,6 +22,24 @@ LOGGER = logging.getLogger(__name__)
 SPECIAL_CHARS = r"_*[]()~`>#+-=|{}.!"
 GODADDY_MICRO_PRICE_THRESHOLD = 1000.0
 GODADDY_MICRO_DIVISOR = 1_000_000.0
+MIN_ULTRA_DISCOUNT_PRICE = 0.5
+ULTRA_DISCOUNT_MULTIPLIER = 0.3
+ULTRA_DISCOUNT_SCORE = 20
+DEEP_DISCOUNT_SCORE = 12
+REGULAR_DISCOUNT_SCORE = 6
+KEYWORD_SCORE_MAX = 50
+KEYWORD_BASE_SCORE = 20
+KEYWORD_LEN_MULTIPLIER = 3
+KEYWORD_EDGE_BONUS = 5
+KEYWORD_COMPONENT_CAP = 45
+LENGTH_COMPONENT_MAX = 30
+OPTIMAL_SLD_LENGTH = 6
+SHORT_LENGTH_UPPER_BOUND = 12
+LONG_NAME_BASE = 8
+SHORT_NAME_PENALTY = 4
+LONG_NAME_PENALTY = 2
+DROP_SIGNAL_SCORE = 5
+EXPIRED_SIGNAL_SCORE = 5
 
 
 class RetryableAPIError(Exception):
@@ -98,6 +116,20 @@ def escape_md_v2(value: str) -> str:
     for char in SPECIAL_CHARS:
         escaped = escaped.replace(char, f"\\{char}")
     return escaped
+
+
+def dedupe_domains(domains: Sequence[str]) -> list[str]:
+    return list(dict.fromkeys(domains))
+
+
+def apply_negative_cache_updates(
+    cache: "TTLDomainCache", requested_domains: Sequence[str], available_domains: set[str]
+) -> None:
+    requested = {d.lower() for d in requested_domains}
+    for domain in requested - available_domains:
+        cache.put(domain)
+    for domain in available_domains:
+        cache.delete(domain)
 
 
 @dataclass(frozen=True)
@@ -192,11 +224,18 @@ class WatcherConfig:
             )
         )
         turbo_hours_raw = os.getenv("TURBO_HOURS_UTC", "13,14,15,16,17,18,19,20,21,22")
-        turbo_hours_utc = {
-            int(hour.strip())
-            for hour in turbo_hours_raw.split(",")
-            if hour.strip().isdigit() and 0 <= int(hour.strip()) <= 23
-        }
+        turbo_hours_utc: set[int] = set()
+        for hour in turbo_hours_raw.split(","):
+            text = hour.strip()
+            if not text.isdigit():
+                if text:
+                    LOGGER.warning("Ignoring invalid TURBO_HOURS_UTC value: %s", text)
+                continue
+            parsed_hour = int(text)
+            if 0 <= parsed_hour <= 23:
+                turbo_hours_utc.add(parsed_hour)
+            else:
+                LOGGER.warning("Ignoring out-of-range TURBO_HOURS_UTC hour: %s", text)
         keywords = {
             k.strip().lower()
             for k in os.getenv("DOMAIN_KEYWORDS", "").split(",")
@@ -354,7 +393,7 @@ class GoDaddyAvailabilitySource:
 
     async def fetch(self, candidates: Sequence[str]) -> list[DomainListing]:
         headers = {"Authorization": f"sso-key {self.api_key}:{self.api_secret}"}
-        deduped = list(dict.fromkeys(candidates))
+        deduped = dedupe_domains(candidates)
         eligible = [domain for domain in deduped if not self._negative_cache.contains(domain)]
         if not eligible:
             return []
@@ -416,7 +455,7 @@ class GoDaddyAvailabilitySource:
                     currency=payload.get("currency", "USD"),
                     is_drop=True,
                 )
-                
+
         listing = await with_exponential_backoff(
             op,
             op_name=f"GoDaddy check {domain}",
@@ -429,8 +468,6 @@ class GoDaddyAvailabilitySource:
         else:
             self._negative_cache.delete(domain)
         return listing
-
-    
 
 
 class NamecheapAvailabilitySource:
@@ -467,7 +504,7 @@ class NamecheapAvailabilitySource:
     async def fetch(self, candidates: Sequence[str]) -> list[DomainListing]:
         if not candidates:
             return []
-        deduped = list(dict.fromkeys(candidates))
+        deduped = dedupe_domains(candidates)
         eligible = [domain for domain in deduped if not self._negative_cache.contains(domain)]
         if not eligible:
             return []
@@ -551,11 +588,7 @@ class NamecheapAvailabilitySource:
                             is_drop=True,
                         )
                     )
-                requested_domains = {d.lower() for d in domains}
-                for domain in requested_domains - available_domains:
-                    self._negative_cache.put(domain)
-                for domain in available_domains:
-                    self._negative_cache.delete(domain)
+                apply_negative_cache_updates(self._negative_cache, domains, available_domains)
                 return listings
 
         return await with_exponential_backoff(
@@ -592,7 +625,7 @@ class NameComAvailabilitySource:
     async def fetch(self, candidates: Sequence[str]) -> list[DomainListing]:
         if not candidates:
             return []
-        deduped = list(dict.fromkeys(candidates))
+        deduped = dedupe_domains(candidates)
         eligible = [domain for domain in deduped if not self._negative_cache.contains(domain)]
         if not eligible:
             return []
@@ -690,11 +723,7 @@ class NameComAvailabilitySource:
                             is_drop=True,
                         )
                     )
-                requested_domains = {d.lower() for d in domains}
-                for domain in requested_domains - available_domains:
-                    self._negative_cache.put(domain)
-                for domain in available_domains:
-                    self._negative_cache.delete(domain)
+                apply_negative_cache_updates(self._negative_cache, domains, available_domains)
                 return listings
 
         for endpoint in endpoints:
@@ -803,35 +832,39 @@ def build_hot_deal_reason(listing: DomainListing, cfg: WatcherConfig) -> Optiona
     return None
 
 
-def compute_confidence_score(listing: DomainListing, cfg: WatcherConfig) -> int:
+def compute_confidence_score(
+    listing: DomainListing, cfg: WatcherConfig, keyword: Optional[str] = None
+) -> int:
     score = 0
 
-    keyword = listing.keyword_match or keyword_hit(listing.sld, cfg.keywords)
+    keyword = keyword or listing.keyword_match or keyword_hit(listing.sld, cfg.keywords)
     if keyword:
-        kw_strength = min(45, 20 + len(keyword) * 3)
+        kw_strength = min(KEYWORD_COMPONENT_CAP, KEYWORD_BASE_SCORE + len(keyword) * KEYWORD_LEN_MULTIPLIER)
         if listing.sld.startswith(keyword) or listing.sld.endswith(keyword):
-            kw_strength += 5
-        score += min(50, kw_strength)
+            kw_strength += KEYWORD_EDGE_BONUS
+        score += min(KEYWORD_SCORE_MAX, kw_strength)
 
     sld_len = len(listing.sld)
-    if sld_len <= 12:
-        length_score = max(0, 30 - abs(sld_len - 6) * 4)
+    if sld_len <= SHORT_LENGTH_UPPER_BOUND:
+        length_score = max(0, LENGTH_COMPONENT_MAX - abs(sld_len - OPTIMAL_SLD_LENGTH) * SHORT_NAME_PENALTY)
     else:
-        length_score = max(0, 8 - (sld_len - 12) * 2)
-    score += min(30, length_score)
+        length_score = max(0, LONG_NAME_BASE - (sld_len - SHORT_LENGTH_UPPER_BOUND) * LONG_NAME_PENALTY)
+    score += min(LENGTH_COMPONENT_MAX, length_score)
 
     if listing.price_usd is not None and listing.price_usd >= 0:
-        if listing.price_usd <= max(0.5, cfg.standard_reg_max * 0.3):
-            score += 20
+        # Keep a fixed low floor and a dynamic baseline to avoid over-scoring tiny absolute deltas
+        # when standard registrar pricing is already very low.
+        if listing.price_usd <= max(MIN_ULTRA_DISCOUNT_PRICE, cfg.standard_reg_max * ULTRA_DISCOUNT_MULTIPLIER):
+            score += ULTRA_DISCOUNT_SCORE
         elif listing.price_usd <= cfg.standard_reg_max * (1 - cfg.discount_trigger_pct / 100):
-            score += 12
+            score += DEEP_DISCOUNT_SCORE
         elif listing.price_usd <= cfg.standard_reg_max:
-            score += 6
+            score += REGULAR_DISCOUNT_SCORE
 
     if listing.is_drop:
-        score += 5
+        score += DROP_SIGNAL_SCORE
     if listing.is_expired:
-        score += 5
+        score += EXPIRED_SIGNAL_SCORE
 
     return max(0, min(100, int(score)))
 
@@ -1005,14 +1038,14 @@ async def watch_events(app: Application, chat_id: int) -> None:
             while True:
                 listings: list[DomainListing] = []
                 tasks: list[asyncio.Task] = []
-                shared_candidates = build_candidates(cfg)
+                candidates_for_cycle = build_candidates(cfg)
 
                 if go_source:
-                    tasks.append(asyncio.create_task(go_source.fetch(shared_candidates)))
+                    tasks.append(asyncio.create_task(go_source.fetch(list(candidates_for_cycle))))
                 if namecheap_source:
-                    tasks.append(asyncio.create_task(namecheap_source.fetch(shared_candidates)))
+                    tasks.append(asyncio.create_task(namecheap_source.fetch(list(candidates_for_cycle))))
                 if namecom_source:
-                    tasks.append(asyncio.create_task(namecom_source.fetch(shared_candidates)))
+                    tasks.append(asyncio.create_task(namecom_source.fetch(list(candidates_for_cycle))))
                 if exp_source:
                     tasks.append(asyncio.create_task(exp_source.fetch()))
 
@@ -1031,7 +1064,11 @@ async def watch_events(app: Application, chat_id: int) -> None:
                     kw = keyword_hit(listing.sld, cfg.keywords)
                     if not kw:
                         continue
-                    score = compute_confidence_score(replace(listing, keyword_match=kw), cfg)
+                    score = compute_confidence_score(
+                        replace(listing, keyword_match=kw),
+                        cfg,
+                        keyword=kw,
+                    )
                     listing = replace(listing, keyword_match=kw, confidence_score=score)
 
                     if store.has_alerted(listing.domain):
