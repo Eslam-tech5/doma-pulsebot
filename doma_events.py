@@ -58,12 +58,20 @@ class DomainOpportunity:
 
 @dataclass(frozen=True)
 class ValuationResult:
+    """Result of domain valuation and margin gating.
+
+    brandability_score is an optional numeric signal from Atom appraisal.
+    root_word_analysis is an optional structured payload from Atom appraisal.
+    """
+
     estimated_value_usd: float
     method: str
     reason: str
     margin_usd: float
     margin_ratio: float
     is_high_margin: bool
+    brandability_score: Optional[float] = None
+    root_word_analysis: Optional[Any] = None
 
 
 @dataclass
@@ -84,7 +92,35 @@ class WatcherConfig:
     min_margin_usd: float = 20.0
     min_margin_ratio: float = 1.8
     allowed_tlds: set[str] = field(default_factory=lambda: {".dev", ".app", ".cloud"})
-    high_value_keywords: set[str] = field(default_factory=lambda: {"ai", "tech", "finance"})
+    high_value_keywords: set[str] = field(
+        default_factory=lambda: {
+            "ai",
+            "crypto",
+            "cloud",
+            "data",
+            "dev",
+            "app",
+            "bot",
+            "pay",
+            "trade",
+            "labs",
+        }
+    )
+    negative_keywords: set[str] = field(
+        default_factory=lambda: {
+            "gibberish",
+            "unbrandable",
+            "unpronounceable",
+            "nonsense",
+            "meaningless",
+            "awkward",
+            "spammy",
+        }
+    )
+    min_brandability_score: float = 35.0
+    appraisal_cache_ttl_seconds: int = 24 * 60 * 60
+    appraisal_batch_size: int = 10
+    appraisal_concurrency: int = 5
     keyword_value_usd: float = 22.0
     atom_partnership_url: str = ""
     atom_domain_base_url: str = "https://www.atom.com/domains"
@@ -113,8 +149,16 @@ class WatcherConfig:
         partnership_url = os.getenv("ATOM_PARTNERSHIP_API_URL", "").strip()
         appraisal_url = os.getenv("ATOM_APPRAISAL_API_URL", "").strip()
         trademark_url = os.getenv("ATOM_TRADEMARK_API_URL", "").strip()
-        raw_keywords = os.getenv("HIGH_VALUE_KEYWORDS", "ai,tech,finance")
-        high_value_keywords = {kw.strip().lower() for kw in raw_keywords.split(",") if kw.strip()}
+        raw_high_value_keywords = os.getenv(
+            "HIGH_VALUE_KEYWORDS",
+            "ai,crypto,cloud,data,dev,app,bot,pay,trade,labs",
+        )
+        high_value_keywords = {kw.strip().lower() for kw in raw_high_value_keywords.split(",") if kw.strip()}
+        raw_negative_keywords = os.getenv(
+            "NEGATIVE_KEYWORDS",
+            "gibberish,unbrandable,unpronounceable,nonsense,meaningless,awkward,spammy",
+        )
+        negative_keywords = {kw.strip().lower() for kw in raw_negative_keywords.split(",") if kw.strip()}
         return cls(
             poll_seconds=int(os.getenv("WATCHER_POLL_SECONDS", "30")),
             eco_poll_seconds=int(os.getenv("ECO_POLL_SECONDS", "120")),
@@ -138,7 +182,17 @@ class WatcherConfig:
             min_margin_usd=float(os.getenv("ARBITRAGE_MIN_GAP_USD", "20")),
             min_margin_ratio=float(os.getenv("ARBITRAGE_MIN_RATIO", "1.8")),
             allowed_tlds=allowed_tlds or {".dev", ".app", ".cloud"},
-            high_value_keywords=high_value_keywords or {"ai", "tech", "finance"},
+            high_value_keywords=high_value_keywords
+            or {"ai", "crypto", "cloud", "data", "dev", "app", "bot", "pay", "trade", "labs"},
+            negative_keywords=negative_keywords
+            or {"gibberish", "unbrandable", "unpronounceable", "nonsense", "meaningless", "awkward", "spammy"},
+            min_brandability_score=float(os.getenv("MIN_BRANDABILITY_SCORE", "35")),
+            appraisal_cache_ttl_seconds=max(
+                60,
+                int(os.getenv("APPRAISAL_CACHE_TTL_SECONDS", str(24 * 60 * 60))),
+            ),
+            appraisal_batch_size=max(1, int(os.getenv("APPRAISAL_BATCH_SIZE", "10"))),
+            appraisal_concurrency=max(1, int(os.getenv("APPRAISAL_CONCURRENCY", "5"))),
             keyword_value_usd=float(os.getenv("KEYWORD_VALUE_USD", "22")),
             atom_partnership_url=partnership_url,
             atom_domain_base_url=os.getenv("ATOM_DOMAIN_BASE_URL", "https://www.atom.com/domains").strip() or "https://www.atom.com/domains",
@@ -387,7 +441,11 @@ class AtomClient:
         self.cfg = cfg
         self._partnership_url = cfg.atom_partnership_url
         self._quota_backoff_until_monotonic = 0.0
+        self._circuit_failures = 0
+        self._circuit_open_until_monotonic = 0.0
         self._logged_trademark_config_warning = False
+        self._appraisal_cache: dict[str, tuple[float, dict[str, Any]]] = {}
+        self._appraisal_cache_lock = asyncio.Lock()
 
     def _headers(self, api_key: str) -> dict[str, str]:
         headers = {"Accept": "application/json"}
@@ -592,7 +650,33 @@ class AtomClient:
 
         return opportunities
 
-    async def appraise_with_atom_ai(self, domain: str) -> float:
+    async def _read_cached_appraisal(self, domain: str) -> Optional[dict[str, Any]]:
+        key = domain.lower()
+        now = asyncio.get_running_loop().time()
+        async with self._appraisal_cache_lock:
+            cached = self._appraisal_cache.get(key)
+            if not cached:
+                return None
+            expires_at, payload = cached
+            if expires_at <= now:
+                self._appraisal_cache.pop(key, None)
+                return None
+            return payload.copy()
+
+    async def _write_cached_appraisal(self, domain: str, payload: dict[str, Any]) -> None:
+        key = domain.lower()
+        expires_at = asyncio.get_running_loop().time() + self.cfg.appraisal_cache_ttl_seconds
+        async with self._appraisal_cache_lock:
+            now = asyncio.get_running_loop().time()
+            expired_keys = [cached_key for cached_key, (expiry, _) in self._appraisal_cache.items() if expiry <= now]
+            for expired_key in expired_keys:
+                self._appraisal_cache.pop(expired_key, None)
+            self._appraisal_cache[key] = (expires_at, payload.copy())
+
+    async def appraise_with_atom_ai(self, domain: str) -> dict[str, Any]:
+        cached = await self._read_cached_appraisal(domain)
+        if cached is not None:
+            return cached
         if not self.cfg.atom_appraisal_url:
             raise AppraisalUnavailableError("ATOM_APPRAISAL_API_URL is not set")
         if self.circuit_open_remaining_seconds() > 0:
@@ -656,6 +740,8 @@ class AtomClient:
             )
 
         value = None
+        brandability_score = None
+        root_word_analysis = None
         if isinstance(data, dict):
             value = (
                 parse_float(data.get("appraised_value_usd"))
@@ -666,6 +752,10 @@ class AtomClient:
                 or parse_float(data.get("value"))
                 or parse_float(data.get("estimate"))
             )
+            brandability_score = parse_float(data.get("brandability_score")) or parse_float(
+                data.get("brandabilityScore")
+            )
+            root_word_analysis = data.get("root_word_analysis") or data.get("rootWordAnalysis")
             if value is None:
                 details = extract_error_message(data)
                 if details:
@@ -674,7 +764,13 @@ class AtomClient:
         if value is None or value <= 0:
             raise AppraisalUnavailableError("AI appraisal did not provide a valid estimated value")
 
-        return float(value)
+        payload = {
+            "estimated_value_usd": float(value),
+            "brandability_score": float(brandability_score) if brandability_score is not None else None,
+            "root_word_analysis": root_word_analysis,
+        }
+        await self._write_cached_appraisal(domain, payload)
+        return payload
 
     async def passes_trademark_filter(self, domain: str) -> bool:
         if not self.cfg.atom_trademark_url:
@@ -736,8 +832,13 @@ async def evaluate_opportunity(
 ) -> ValuationResult:
     method = "atom_ai"
     reason = "Atom Appraisal API"
+    brandability_score: Optional[float] = None
+    root_word_analysis: Optional[Any] = None
     try:
-        ai_value = await client.appraise_with_atom_ai(opportunity.domain)
+        appraisal_payload = await client.appraise_with_atom_ai(opportunity.domain)
+        ai_value = appraisal_payload["estimated_value_usd"]
+        brandability_score = parse_float(appraisal_payload.get("brandability_score"))
+        root_word_analysis = appraisal_payload.get("root_word_analysis")
         estimated = ai_value
         LOGGER.info("Valuation method=AI domain=%s estimated=$%.2f", opportunity.domain, estimated)
     except AppraisalUnavailableError as exc:
@@ -759,6 +860,21 @@ async def evaluate_opportunity(
     is_high_margin = method == "bypass_no_appraisal" or (
         margin_usd >= cfg.min_margin_usd and ratio >= cfg.min_margin_ratio
     )
+    rejection_reasons: list[str] = []
+    analysis_text = flatten_to_text(root_word_analysis)
+    matched_negative_keyword = first_negative_keyword_match(
+        analysis_text,
+        cfg.negative_keywords,
+    )
+    if matched_negative_keyword:
+        rejection_reasons.append(f"negative keyword '{matched_negative_keyword}'")
+    if brandability_score is not None and brandability_score < cfg.min_brandability_score:
+        rejection_reasons.append(
+            f"brandability {brandability_score:.2f}<{cfg.min_brandability_score:.2f}"
+        )
+    if rejection_reasons and method != "bypass_no_appraisal":
+        is_high_margin = False
+        reason = f"{reason}; rejected for precision ({', '.join(rejection_reasons)})"
 
     return ValuationResult(
         estimated_value_usd=round(estimated, 2),
@@ -767,7 +883,38 @@ async def evaluate_opportunity(
         margin_usd=round(margin_usd, 2),
         margin_ratio=round(ratio, 2),
         is_high_margin=is_high_margin,
+        brandability_score=round(brandability_score, 2) if brandability_score is not None else None,
+        root_word_analysis=root_word_analysis,
     )
+
+
+def flatten_to_text(value: Any) -> str:
+    if value is None:
+        return ""
+    if isinstance(value, str):
+        return value.strip().lower()
+    if isinstance(value, (int, float, bool)):
+        return str(value).lower()
+    if isinstance(value, dict):
+        parts: list[str] = []
+        for item in value.values():
+            text = flatten_to_text(item)
+            if text:
+                parts.append(text)
+        return " ".join(parts)
+    if isinstance(value, list):
+        parts = [flatten_to_text(item) for item in value]
+        return " ".join(part for part in parts if part)
+    return str(value).lower()
+
+
+def first_negative_keyword_match(text: str, negative_keywords: set[str]) -> Optional[str]:
+    if not text:
+        return None
+    for keyword in sorted(negative_keywords):
+        if keyword and keyword in text:
+            return keyword
+    return None
 
 
 def format_alert(opportunity: DomainOpportunity, valuation: ValuationResult) -> str:
@@ -778,14 +925,22 @@ def format_alert(opportunity: DomainOpportunity, valuation: ValuationResult) -> 
     estimate = escape_md_v2(f"${valuation.estimated_value_usd:.2f} USD")
     gap = escape_md_v2(f"${valuation.margin_usd:.2f}")
     ratio = escape_md_v2(f"x{valuation.margin_ratio:.2f}")
+    brandability = (
+        escape_md_v2(f"{valuation.brandability_score:.2f}")
+        if valuation.brandability_score is not None
+        else "N/A"
+    )
 
     return (
         "🔥 *High\\-Margin Domain Deal*\n"
         f"🌐 *Domain:* `{domain}`\n"
         f"🏪 *Source:* {source}\n"
-        f"💵 *Asking vs Appraisal:* {ask} vs {estimate}\n"
-        f"📈 *Arbitrage Gap \\(Est\\. Profit\\):* {gap} \\({ratio}\\)\n"
-        f"⚙️ *Valuation Method:* `{method}`"
+        f"💵 *Asking Price:* {ask}\n"
+        f"🧠 *Estimated Value:* {estimate}\n"
+        f"🎯 *Brandability:* {brandability}\n"
+        f"📈 *Gap:* {gap} \\({ratio}\\)\n"
+        f"⚙️ *Valuation Method:* `{method}`\n"
+        f"🔗 *Listing:* {listing_url}"
     )
 
 
@@ -885,6 +1040,7 @@ async def watch_events(app: Application, chat_id: int) -> None:
 
     async with aiohttp.ClientSession(timeout=timeout) as session:
         client = AtomClient(session, cfg)
+        appraisal_semaphore = asyncio.Semaphore(cfg.appraisal_concurrency)
 
         try:
             while True:
@@ -932,61 +1088,54 @@ async def watch_events(app: Application, chat_id: int) -> None:
                     )
 
                 evaluations_left = min(len(priority_heap), cfg.max_domains_per_cycle)
+                candidates: list[DomainOpportunity] = []
                 while priority_heap and evaluations_left > 0:
                     _, _, opportunity = heapq.heappop(priority_heap)
                     evaluations_left -= 1
+                    candidates.append(opportunity)
 
-                    try:
-                        valuation = await evaluate_opportunity(client, opportunity, cfg)
-                    except Exception as exc:
-                        LOGGER.exception("Failed to evaluate %s: %s", opportunity.domain, exc)
-                        continue
+                async def evaluate_with_guard(
+                    candidate: DomainOpportunity,
+                ) -> tuple[DomainOpportunity, Optional[ValuationResult]]:
+                    async with appraisal_semaphore:
+                        try:
+                            valuation = await evaluate_opportunity(client, candidate, cfg)
+                            return candidate, valuation
+                        except Exception as exc:
+                            LOGGER.exception("Failed to evaluate %s: %s", candidate.domain, exc)
+                            return candidate, None
 
-                    if not valuation.is_high_margin:
-                        continue
+                for idx in range(0, len(candidates), cfg.appraisal_batch_size):
+                    batch = candidates[idx : idx + cfg.appraisal_batch_size]
+                    evaluated = await asyncio.gather(*(evaluate_with_guard(item) for item in batch))
 
-                    for target_chat_id in sorted(target_chat_ids):
-                        if store.has_alerted(target_chat_id, opportunity.domain):
+                    for opportunity, valuation in evaluated:
+                        if valuation is None or not valuation.is_high_margin:
                             continue
-
-                        user_filters: dict[str, Any]
-                        if isinstance(chat_filters, dict) and isinstance(chat_filters.get(str(target_chat_id)), dict):
-                            user_filters = chat_filters[str(target_chat_id)]
-                        else:
-                            user_filters = {}
-
-                        if not _chat_filter_matches(opportunity, valuation, user_filters):
-                            continue
-
-                        trademark_enabled = bool(user_filters.get("trademark_check", True))
-                        if trademark_enabled:
-                            if opportunity.domain in trademark_cache:
-                                passes_trademark = trademark_cache[opportunity.domain]
-                            else:
-                                try:
-                                    passes_trademark = await client.passes_trademark_filter(opportunity.domain)
-                                except Exception as exc:
-                                    LOGGER.warning(
-                                        "Trademark filter error for %s - bypassing filter: %s",
-                                        opportunity.domain,
-                                        exc,
-                                    )
-                                    passes_trademark = True
-                                trademark_cache[opportunity.domain] = passes_trademark
-                            if not passes_trademark:
-                                LOGGER.info("Trademark filter blocked domain=%s", opportunity.domain)
-                                continue
 
                         try:
-                            await emit_alert(app, target_chat_id, opportunity, valuation, cfg)
-                            store.mark_alerted(target_chat_id, opportunity.domain, opportunity.source)
+                            passes_trademark = await client.passes_trademark_filter(opportunity.domain)
+                        except Exception as exc:
+                            LOGGER.warning(
+                                "Trademark filter error for %s - bypassing filter: %s",
+                                opportunity.domain,
+                                exc,
+                            )
+                            passes_trademark = True
+                        if not passes_trademark:
+                            LOGGER.info("Trademark filter blocked domain=%s", opportunity.domain)
+                            continue
+
+                        try:
+                            await emit_alert(app, chat_id, opportunity, valuation)
+                            store.mark_alerted(opportunity.domain, opportunity.source)
                             LOGGER.info(
-                                "Alert sent chat_id=%s domain=%s ask=$%.2f estimate=$%.2f method=%s",
-                                target_chat_id,
+                                "Alert sent domain=%s ask=$%.2f estimate=$%.2f method=%s brandability=%s",
                                 opportunity.domain,
                                 opportunity.ask_price_usd,
                                 valuation.estimated_value_usd,
                                 valuation.method,
+                                valuation.brandability_score,
                             )
                         except Exception as exc:
                             LOGGER.exception("Failed to send Telegram alert for %s: %s", opportunity.domain, exc)
