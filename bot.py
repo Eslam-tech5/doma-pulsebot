@@ -17,7 +17,7 @@ DEFAULT_CHAT_ID = int(os.getenv("DEFAULT_CHAT_ID", "123456789"))
 FILTERS_PATH = Path(__file__).with_name("filters.json")
 FILTER_CALLBACK_PREFIX = "flt"
 
-TLD_OPTIONS = (".com", ".dev", ".app", ".ai")
+TLD_OPTIONS = (".ae", ".twitch", ".my", ".com", ".app")
 PRICE_OPTIONS = (50, 100)
 MIN_APPRAISAL_OPTIONS = (1000,)
 MAX_LENGTH_OPTIONS = (10,)
@@ -124,10 +124,11 @@ def build_filter_keyboard(filters: dict[str, Any]) -> InlineKeyboardMarkup:
 
     keyboard = [
         [
+            InlineKeyboardButton(chip(".ae" in tlds, ".ae"), callback_data=f"{FILTER_CALLBACK_PREFIX}:tld:ae"),
+            InlineKeyboardButton(chip(".twitch" in tlds, ".twitch"), callback_data=f"{FILTER_CALLBACK_PREFIX}:tld:twitch"),
+            InlineKeyboardButton(chip(".my" in tlds, ".my"), callback_data=f"{FILTER_CALLBACK_PREFIX}:tld:my"),
             InlineKeyboardButton(chip(".com" in tlds, ".com"), callback_data=f"{FILTER_CALLBACK_PREFIX}:tld:com"),
-            InlineKeyboardButton(chip(".dev" in tlds, ".dev"), callback_data=f"{FILTER_CALLBACK_PREFIX}:tld:dev"),
             InlineKeyboardButton(chip(".app" in tlds, ".app"), callback_data=f"{FILTER_CALLBACK_PREFIX}:tld:app"),
-            InlineKeyboardButton(chip(".ai" in tlds, ".ai"), callback_data=f"{FILTER_CALLBACK_PREFIX}:tld:ai"),
         ],
         [
             InlineKeyboardButton(chip(max_price is None, "Max Price: Any"), callback_data=f"{FILTER_CALLBACK_PREFIX}:maxp:0"),
