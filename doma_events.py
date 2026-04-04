@@ -7,12 +7,14 @@ import re
 import sqlite3
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
+from pathlib import Path
 from typing import Any, Optional
 
 import aiohttp
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.constants import ParseMode
 from telegram.ext import Application
+from vip_database import VipRecord, load_vip_database
 
 LOGGER = logging.getLogger(__name__)
 SPECIAL_CHARS = r"_*[]()~`>#+-=|{}.!"
@@ -41,6 +43,7 @@ class DomainOpportunity:
     source: str
     listing_url: str
     currency: str = "USD"
+    availability_status: str = "Dropping soon"
 
     @property
     def tld(self) -> str:
@@ -91,7 +94,7 @@ class WatcherConfig:
     circuit_breaker_open_seconds: int = 120
     min_margin_usd: float = 20.0
     min_margin_ratio: float = 1.8
-    allowed_tlds: set[str] = field(default_factory=lambda: {".dev", ".app", ".cloud"})
+    allowed_tlds: set[str] = field(default_factory=lambda: {".ae", ".twitch", ".my", ".com", ".app"})
     high_value_keywords: set[str] = field(
         default_factory=lambda: {
             "ai",
@@ -136,7 +139,7 @@ class WatcherConfig:
 
     @classmethod
     def from_env(cls) -> "WatcherConfig":
-        raw_tlds = os.getenv("ALLOWED_TLDS", ".dev,.app,.cloud")
+        raw_tlds = os.getenv("ALLOWED_TLDS", ".ae,.twitch,.my,.com,.app")
         allowed_tlds = {
             t.strip().lower() if t.strip().startswith(".") else f".{t.strip().lower()}"
             for t in raw_tlds.split(",")
@@ -181,7 +184,7 @@ class WatcherConfig:
             ),
             min_margin_usd=float(os.getenv("ARBITRAGE_MIN_GAP_USD", "20")),
             min_margin_ratio=float(os.getenv("ARBITRAGE_MIN_RATIO", "1.8")),
-            allowed_tlds=allowed_tlds or {".dev", ".app", ".cloud"},
+            allowed_tlds=allowed_tlds or {".ae", ".twitch", ".my", ".com", ".app"},
             high_value_keywords=high_value_keywords
             or {"ai", "crypto", "cloud", "data", "dev", "app", "bot", "pay", "trade", "labs"},
             negative_keywords=negative_keywords
@@ -382,9 +385,11 @@ def score_with_internal_rules(domain: str, cfg: WatcherConfig) -> tuple[float, s
         length_score = 18.0
 
     tld_score = {
-        ".dev": 65.0,
+        ".ae": 65.0,
+        ".twitch": 62.0,
+        ".my": 61.0,
+        ".com": 64.0,
         ".app": 58.0,
-        ".cloud": 52.0,
     }.get(tld_pref, 20.0)
 
     matched_keywords = [kw for kw in cfg.high_value_keywords if kw in sld]
@@ -637,6 +642,14 @@ class AtomClient:
             ).strip()
             source = str(row.get("source") or "Atom Partnership").strip() or "Atom Partnership"
             currency = str(row.get("currency") or "USD").strip() or "USD"
+            status_raw = str(
+                row.get("status")
+                or row.get("availability")
+                or row.get("state")
+                or row.get("domain_status")
+                or ""
+            ).strip().lower()
+            availability_status = "Available" if "avail" in status_raw else "Dropping soon"
 
             opportunities.append(
                 DomainOpportunity(
@@ -645,6 +658,7 @@ class AtomClient:
                     source=source,
                     listing_url=listing_url,
                     currency=currency,
+                    availability_status=availability_status,
                 )
             )
 
@@ -940,7 +954,7 @@ def format_alert(opportunity: DomainOpportunity, valuation: ValuationResult) -> 
         f"🎯 *Brandability:* {brandability}\n"
         f"📈 *Gap:* {gap} \\({ratio}\\)\n"
         f"⚙️ *Valuation Method:* `{method}`\n"
-        f"🔗 *Listing:* {listing_url}"
+        f"🔗 *Listing:* {escape_md_v2(opportunity.listing_url)}"
     )
 
 
@@ -962,6 +976,38 @@ async def emit_alert(
         chat_id=chat_id,
         text=format_alert(opportunity, valuation),
         parse_mode=ParseMode.MARKDOWN_V2,
+        reply_markup=keyboard,
+        disable_web_page_preview=True,
+    )
+
+
+def format_vip_alert(opportunity: DomainOpportunity, vip: VipRecord) -> str:
+    domain = f"{opportunity.sld}.{opportunity.tld.lstrip('.')}"
+    return (
+        "🚨 VIP DOMAIN MATCH SPOTTED! 🚨\n"
+        f"🌍 Domain: {domain}\n"
+        f"🟢 Status: {opportunity.availability_status}\n"
+        f"🏢 Sector: {vip.sector or 'N/A'}\n"
+        f"⭐ Rating: {vip.rating or 'N/A'}\n"
+        f"🇬🇧 English Meaning: {vip.meaning_en or 'N/A'}\n"
+        f"🇦🇪 Arabic Meaning: {vip.meaning_ar or 'N/A'}"
+    )
+
+
+async def emit_vip_alert(
+    app: Application,
+    chat_id: int,
+    opportunity: DomainOpportunity,
+    vip: VipRecord,
+    cfg: WatcherConfig,
+) -> None:
+    atom_base = cfg.atom_domain_base_url.rstrip("/")
+    atom_buy_url = f"{atom_base}/{opportunity.domain}"
+    rows = [[InlineKeyboardButton("🔗 BUY NOW / SNIPE", url=atom_buy_url)]]
+    keyboard = InlineKeyboardMarkup(rows)
+    await app.bot.send_message(
+        chat_id=chat_id,
+        text=format_vip_alert(opportunity, vip),
         reply_markup=keyboard,
         disable_web_page_preview=True,
     )
@@ -1021,6 +1067,7 @@ async def watch_events(app: Application, chat_id: int) -> None:
     cfg = WatcherConfig.from_env()
     validate_required_atom_config(cfg)
     store = AlertStore(cfg.db_path)
+    vip_db = load_vip_database(Path(__file__).with_name("vip_data"))
     timeout = aiohttp.ClientTimeout(total=cfg.request_timeout_seconds)
 
     LOGGER.info(
@@ -1037,6 +1084,7 @@ async def watch_events(app: Application, chat_id: int) -> None:
         cfg.human_delay_min_seconds,
         cfg.human_delay_max_seconds,
     )
+    LOGGER.info("VIP DB loaded entries=%s", len(vip_db))
 
     async with aiohttp.ClientSession(timeout=timeout) as session:
         client = AtomClient(session, cfg)
@@ -1107,7 +1155,33 @@ async def watch_events(app: Application, chat_id: int) -> None:
 
                 for idx in range(0, len(candidates), cfg.appraisal_batch_size):
                     batch = candidates[idx : idx + cfg.appraisal_batch_size]
-                    evaluated = await asyncio.gather(*(evaluate_with_guard(item) for item in batch))
+                    vip_candidates: list[DomainOpportunity] = []
+                    non_vip_candidates: list[DomainOpportunity] = []
+                    for item in batch:
+                        vip_match = (
+                            item.tld in cfg.allowed_tlds
+                            and item.sld in vip_db
+                        )
+                        if vip_match:
+                            vip_candidates.append(item)
+                        else:
+                            non_vip_candidates.append(item)
+
+                    for opportunity in vip_candidates:
+                        try:
+                            vip_record = vip_db.get(opportunity.sld)
+                            if vip_record is None:
+                                continue
+                            for target_chat_id in target_chat_ids:
+                                if store.has_alerted(target_chat_id, opportunity.domain):
+                                    continue
+                                await emit_vip_alert(app, target_chat_id, opportunity, vip_record, cfg)
+                                store.mark_alerted(target_chat_id, opportunity.domain, opportunity.source)
+                            LOGGER.info("VIP alert sent domain=%s status=%s", opportunity.domain, opportunity.availability_status)
+                        except Exception as exc:
+                            LOGGER.exception("Failed to send VIP Telegram alert for %s: %s", opportunity.domain, exc)
+
+                    evaluated = await asyncio.gather(*(evaluate_with_guard(item) for item in non_vip_candidates))
 
                     for opportunity, valuation in evaluated:
                         if valuation is None or not valuation.is_high_margin:
@@ -1127,8 +1201,14 @@ async def watch_events(app: Application, chat_id: int) -> None:
                             continue
 
                         try:
-                            await emit_alert(app, chat_id, opportunity, valuation)
-                            store.mark_alerted(opportunity.domain, opportunity.source)
+                            for target_chat_id in target_chat_ids:
+                                if store.has_alerted(target_chat_id, opportunity.domain):
+                                    continue
+                                filters = chat_filters.get(str(target_chat_id), {})
+                                if not _chat_filter_matches(opportunity, valuation, filters):
+                                    continue
+                                await emit_alert(app, target_chat_id, opportunity, valuation, cfg)
+                                store.mark_alerted(target_chat_id, opportunity.domain, opportunity.source)
                             LOGGER.info(
                                 "Alert sent domain=%s ask=$%.2f estimate=$%.2f method=%s brandability=%s",
                                 opportunity.domain,
